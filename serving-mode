@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# serving-mode — toggle a DGX Spark (or any Ubuntu box) between its full desktop
+# state, a pared-down ssh-only state, and a headless inference-SERVING state.
+#
+# Why: the DGX Spark has 128 GB of UNIFIED memory shared between the OS/desktop
+# and the GPU. The GNOME desktop, snap/maintenance daemons, and assorted timers
+# can hold ~10-15 GB that would otherwise be available to the vLLM KV cache.
+# Dropping to multi-user.target (no GUI) and paring back desktop/maintenance
+# services hands that memory back to the model — directly raising the KV pool /
+# usable context length.
+#
+#   sudo ~/bin/serving-mode on [-u]   pared down: multi-user target, desktop /
+#                                     maintenance services and timers off
+#                                     (INCLUDING docker); -u also stops+disables
+#                                     YOUR user units (see serving-mode.conf).
+#   sudo ~/bin/serving-mode serve     headless SERVE: multi-user target, desktop /
+#                                     maintenance off, but DOCKER KEPT UP and the
+#                                     model unit + your user units brought up.
+#                                     Linger enabled so the stack survives logout/
+#                                     reboot. Re-enables NO graphical services.
+#   sudo ~/bin/serving-mode off [-u]  restore: graphical target, everything back;
+#                                     -u also re-enables+starts the user units.
+#        ~/bin/serving-mode status    show current state incl. user units (no sudo)
+#
+# 'on' and 'serve' persist across reboots (set-default multi-user.target).
+# NEVER touched in any mode: ssh, NetworkManager + systemd-networkd (one of them
+# owns the SSH link), resolved, timesyncd, udevd, journald, logind, dbus, polkit,
+# nvidia-persistenced, rasdaemon (ECC/RAS witness under memory pressure),
+# logrotate, fstrim, getty consoles, user sessions.
+#
+# Site config (optional): define your own GPU sidecars / model unit in
+#   ~/.config/serving-mode.conf   (see serving-mode.conf.example)
+# Without it, serving-mode still does the valuable part — pare the desktop and
+# free unified memory; it just won't manage any user units or a model unit.
+#
+# From: https://github.com/Entrpi/qwen3.5-122B-A10B-on-spark (serving recipe)
+set -u
+
+# ---- Desktop / maintenance services turned OFF in both 'on' and 'serve'. ----
+SERVICES=(
+  cups.service cups.socket cups.path cups-browsed.service
+  bluetooth.service
+  avahi-daemon.service avahi-daemon.socket
+  ModemManager.service
+  fwupd.service colord.service upower.service
+  snapd.service snapd.socket snapd.seeded.service
+  nvidia-dcgm.service dgx-dashboard-admin.service
+  lldpd.service smartmontools.service
+  multipathd.service multipathd.socket
+  rsyslog.service cron.service
+)
+# Docker/containerd: EXTRANEOUS in 'on' (disabled), but LOAD-BEARING in 'serve'
+# (the model is served from a container) — kept up there. Restored by 'off'.
+DOCKER_SERVICES=(docker.service docker.socket containerd.service)
+TIMERS=(
+  apt-daily.timer apt-daily-upgrade.timer
+  update-notifier-download.timer update-notifier-motd.timer motd-news.timer
+  man-db.timer ua-timer.timer fwupd-refresh.timer anacron.timer
+  sysstat-collect.timer sysstat-summary.timer dpkg-db-backup.timer
+  e2scrub_all.timer systemd-tmpfiles-clean.timer
+)
+
+# ---- Site-specific units (overridden by ~/.config/serving-mode.conf) ----
+#   USER_UNITS       — your systemd --user units managed by 'on -u' / 'off -u'.
+#   SERVE_USER_UNITS — the user stack brought up by 'serve'.
+#   MODEL_UNIT       — system unit that runs the vLLM container (see examples/).
+# Defaults are EMPTY so the script is useful with no config (desktop paring only).
+USER_UNITS=()
+SERVE_USER_UNITS=()
+MODEL_UNIT=""
+
+TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_UID="$(id -u "$TARGET_USER")"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+CONF="${SERVING_MODE_CONF:-$TARGET_HOME/.config/serving-mode.conf}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && source "$CONF"
+
+mem() { awk '/MemAvailable/{printf "%.1f GB", $2/1048576}' /proc/meminfo; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "run: sudo $0 ${1:-}"; exit 1; }; }
+
+# Run systemctl --user as the target user (works from root via runuser, and
+# directly when invoked unprivileged).
+uctl() {
+  if [ "$(id -u)" = 0 ]; then
+    runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=/run/user/$TARGET_UID" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$TARGET_UID/bus" \
+      systemctl --user "$@"
+  else
+    systemctl --user "$@"
+  fi
+}
+
+USER_FLAG=0
+{ [ "${2:-}" = "-u" ] || [ "${2:-}" = "--user" ]; } && USER_FLAG=1
+
+case "${1:-}" in
+  on)
+    need_root on
+    echo "MemAvailable before: $(mem)"
+    systemctl set-default multi-user.target >/dev/null
+    for u in "${SERVICES[@]}" "${DOCKER_SERVICES[@]}" "${TIMERS[@]}"; do
+      systemctl disable --now "$u" >/dev/null 2>&1
+    done
+    systemctl mask unattended-upgrades.service >/dev/null 2>&1
+    # Wi-Fi supplicant: only stop it if no wifi link is currently active.
+    if nmcli -t -f TYPE,STATE d 2>/dev/null | grep -q '^wifi:connected'; then
+      echo "NOTE: wifi link active -> wpa_supplicant left running"
+    else
+      systemctl disable --now wpa_supplicant.service >/dev/null 2>&1
+    fi
+    if [ "$USER_FLAG" = 1 ] && [ "${#USER_UNITS[@]}" -gt 0 ]; then
+      for uu in "${USER_UNITS[@]}"; do
+        uctl disable --now "$uu" >/dev/null 2>&1
+      done
+      echo "user units stopped+disabled: ${USER_UNITS[*]}"
+    fi
+    systemctl isolate multi-user.target
+    sleep 2
+    echo "MemAvailable after:  $(mem)"
+    echo "serving mode ON (persists across reboots; restore: sudo $0 off${USER_FLAG:+ -u})"
+    ;;
+  serve)
+    need_root serve
+    echo "MemAvailable before: $(mem)"
+    systemctl set-default multi-user.target >/dev/null
+    # Pare down desktop/maintenance, but DO NOT touch docker here.
+    for u in "${SERVICES[@]}" "${TIMERS[@]}"; do
+      systemctl disable --now "$u" >/dev/null 2>&1
+    done
+    systemctl mask unattended-upgrades.service >/dev/null 2>&1
+    if nmcli -t -f TYPE,STATE d 2>/dev/null | grep -q '^wifi:connected'; then
+      echo "NOTE: wifi link active -> wpa_supplicant left running"
+    else
+      systemctl disable --now wpa_supplicant.service >/dev/null 2>&1
+    fi
+    # Docker is load-bearing for serving: ensure it is enabled and running.
+    for u in "${DOCKER_SERVICES[@]}"; do
+      systemctl enable --now "$u" >/dev/null 2>&1
+    done
+    echo "docker kept up: $(systemctl is-active docker.service 2>/dev/null)"
+    # Let user units run headless without an active login session.
+    loginctl enable-linger "$TARGET_USER" >/dev/null 2>&1
+    # Bring up the user stack (agent + GPU sidecars), if any configured.
+    if [ "${#SERVE_USER_UNITS[@]}" -gt 0 ]; then
+      for uu in "${SERVE_USER_UNITS[@]}"; do
+        uctl enable --now "$uu" >/dev/null 2>&1
+      done
+      echo "user units up: ${SERVE_USER_UNITS[*]}"
+    fi
+    # Bring up the model server if its unit is installed.
+    if [ -n "$MODEL_UNIT" ] && systemctl cat "$MODEL_UNIT" >/dev/null 2>&1; then
+      systemctl enable --now "$MODEL_UNIT" >/dev/null 2>&1
+      echo "model unit started: $MODEL_UNIT ($(systemctl is-active "$MODEL_UNIT" 2>/dev/null))"
+    else
+      echo "NOTE: model unit '${MODEL_UNIT:-<none>}' not installed — model not auto-started"
+      echo "      (install examples/vllm-model.service and set MODEL_UNIT in the conf)"
+    fi
+    systemctl isolate multi-user.target
+    sleep 2
+    echo "MemAvailable after:  $(mem)"
+    echo "SERVE mode ON (docker up; model+user units up; persists across reboots; restore: sudo $0 off)"
+    ;;
+  off)
+    need_root off
+    systemctl unmask unattended-upgrades.service >/dev/null 2>&1
+    for u in "${SERVICES[@]}" "${DOCKER_SERVICES[@]}"; do
+      systemctl enable --now "$u" >/dev/null 2>&1
+    done
+    for t in "${TIMERS[@]}"; do
+      systemctl enable "$t" >/dev/null 2>&1
+    done
+    systemctl enable --now wpa_supplicant.service >/dev/null 2>&1
+    if [ "$USER_FLAG" = 1 ] && [ "${#USER_UNITS[@]}" -gt 0 ]; then
+      for uu in "${USER_UNITS[@]}"; do
+        uctl enable --now "$uu" >/dev/null 2>&1
+      done
+      echo "user units re-enabled+started: ${USER_UNITS[*]}"
+    fi
+    systemctl set-default graphical.target >/dev/null
+    systemctl isolate graphical.target
+    echo "default state restored (graphical target, services + timers re-enabled)"
+    echo "NOTE: 'off' enables the FULL managed list, including anything you had"
+    echo "      manually disabled before serving-mode ever ran."
+    ;;
+  status)
+    echo "default target : $(systemctl get-default)"
+    echo "MemAvailable   : $(mem)"
+    echo "docker         : $(systemctl is-active docker.service 2>/dev/null)"
+    echo "linger ($TARGET_USER) : $(loginctl show-user "$TARGET_USER" -p Linger --value 2>/dev/null)"
+    run=0; stop=0
+    for u in "${SERVICES[@]}"; do
+      if systemctl is-active --quiet "$u" 2>/dev/null; then run=$((run+1)); else stop=$((stop+1)); fi
+    done
+    echo "managed services: $run running / $stop stopped"
+    if systemctl is-active --quiet gdm3 2>/dev/null || systemctl is-active --quiet gdm 2>/dev/null; then
+      echo "display manager : running"
+    else
+      echo "display manager : stopped"
+    fi
+    if [ -n "$MODEL_UNIT" ] && systemctl cat "$MODEL_UNIT" >/dev/null 2>&1; then
+      echo "model unit      : $MODEL_UNIT = $(systemctl is-active "$MODEL_UNIT" 2>/dev/null)"
+    else
+      echo "model unit      : ${MODEL_UNIT:-<none>} = not-installed"
+    fi
+    for uu in "${SERVE_USER_UNITS[@]}"; do
+      st=$(uctl is-active "$uu" 2>/dev/null); [ -n "$st" ] || st=unknown
+      echo "user unit       : $uu = $st"
+    done
+    ;;
+  *)
+    echo "usage: sudo $0 on|serve|off   (or: $0 status)"
+    exit 1
+    ;;
+esac

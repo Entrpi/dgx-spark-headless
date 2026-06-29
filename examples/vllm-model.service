@@ -1,0 +1,43 @@
+# vllm-model.service — run the vLLM model container as a managed system service,
+# so `serving-mode serve` auto-starts it and it survives reboot.
+#
+# Install:
+#   sudo cp examples/vllm-model.service /etc/systemd/system/vllm-model.service
+#   # edit the paths / image / model below to match your box, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vllm-model.service     # (or: serving-mode serve)
+#
+# This template launches the recipe from
+#   https://github.com/Entrpi/qwen3.5-122B-A10B-on-spark
+# Adjust USER, paths, image tag, MODEL, and the serve.sh args for your setup.
+# Runs the container in the FOREGROUND (no -d) so systemd supervises it; --rm so
+# a crash/restart starts clean. Prefix caching is ON by default in serve.sh
+# (set -e PREFIX_CACHE=0 to disable).
+
+[Unit]
+Description=vLLM model server (Qwen3.5-122B-A10B, DFlash) in Docker
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Clean up any stale container from a previous run.
+ExecStartPre=-/usr/bin/docker rm -f qwen-spark
+ExecStart=/usr/bin/docker run --rm --name qwen-spark \
+  --gpus all --net=host --ipc=host --ulimit memlock=-1:-1 \
+  -e HF_HOME=/hf -e VLLM_CACHE_ROOT=/hf/.vllm_cache \
+  -e MODEL=bleysg/Qwen3.5-122B-A10B-int4-fp8-hybrid -e INC_HYBRID=1 -e INT8_LMHEAD_V3=1 \
+  -v /home/YOUR_USER/.cache/huggingface:/hf \
+  -v /home/YOUR_USER/qwen3.5-122B-A10B-on-spark/runtime:/host:ro \
+  --entrypoint bash \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix \
+  /host/serve.sh 12 flash_attn
+ExecStop=/usr/bin/docker stop qwen-spark
+# Model load is ~3 min; give it room before systemd considers start failed.
+TimeoutStartSec=900
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

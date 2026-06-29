@@ -1,0 +1,32 @@
+# serving-mode.conf — optional site config for the `serving-mode` script.
+# Copy to ~/.config/serving-mode.conf and edit. All three vars are optional;
+# without this file, serving-mode still pares the desktop and frees unified
+# memory — it just won't touch any user units or a model unit.
+#
+# These are bash array / scalar assignments sourced by serving-mode.
+
+# systemd --user units you want stopped+disabled by `serving-mode on -u`
+# and restored by `serving-mode off -u`. (Your own GPU sidecars / agents.)
+USER_UNITS=(
+  # my-gpu-sidecar.service
+  # my-agent.service
+)
+
+# The user stack `serving-mode serve` brings up headless (linger-enabled).
+# Usually the same as USER_UNITS, optionally plus extras.
+SERVE_USER_UNITS=(
+  # my-gpu-sidecar.service
+  # my-agent.service
+)
+
+# System unit that runs the vLLM model container (see examples/vllm-model.service).
+# `serving-mode serve` starts it; leave empty to manage the model yourself.
+MODEL_UNIT="vllm-model.service"
+
+# ---------------------------------------------------------------------------
+# Example: the setup this script came from (Hermes agent on a DGX Spark) ran
+#   USER_UNITS=(hermes-gateway.service stt-sidecar.service diarize-sidecar.service)
+#   SERVE_USER_UNITS=(hermes-gateway.service stt-sidecar.service diarize-sidecar.service pantalaimon.service)
+# i.e. a couple of GPU sidecars (STT / diarization) + the agent + a Matrix proxy,
+# all as `systemd --user` units. `serve` brings the whole stack up headless and
+# linger-enabled so it survives reboot. Put YOUR units above.
